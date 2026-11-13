@@ -1,0 +1,83 @@
+# Security scan: Semgrep CE (code), OSV-Scanner (dependencies), Gitleaks (secrets).
+# First rollout is REPORT-ONLY except: Semgrep ERROR findings that are NEW in a PR fail the PR.
+# Results are uploaded as artifacts (secrets redacted). Versions pinned (>= 2 weeks old at pin time).
+name: security-scan
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '17 3 * * 1'   # Mondays 03:17 UTC: full scan, catches newly published CVEs
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: security-scan-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  semgrep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    container: semgrep/semgrep:1.182.0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Semgrep CE (p/default, no login, metrics off)
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            # PR: fail only on NEW high-severity findings introduced by this PR
+            semgrep scan --config p/default --metrics=off --severity ERROR --error \
+              --baseline-commit "origin/$GITHUB_BASE_REF" --json-output=semgrep.json --text
+          else
+            # main / weekly: full report, never fails the build (baseline period)
+            semgrep scan --config p/default --metrics=off --json-output=semgrep.json --text || true
+          fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: semgrep
+          path: semgrep.json
+          retention-days: 30
+  dependencies:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: OSV-Scanner (lock files, report-only)
+        run: |
+          docker run --rm -v "$PWD:/src" ghcr.io/google/osv-scanner:v2.7.0 \
+            scan source -r --format table /src || echo "::warning::OSV-Scanner found vulnerable dependencies (see log)"
+          docker run --rm -v "$PWD:/src" ghcr.io/google/osv-scanner:v2.7.0 \
+            scan source -r --format json /src > osv.json || true
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: osv
+          path: osv.json
+          if-no-files-found: ignore
+          retention-days: 30
+  secrets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Gitleaks (full history, redacted, report-only)
+        run: |
+          docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:v8.30.1 \
+            git /repo --redact --no-banner --report-format json --report-path /repo/gitleaks.json \
+            || echo "::warning::Gitleaks found possible secrets (redacted report in artifact)"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: gitleaks
+          path: gitleaks.json
+          if-no-files-found: ignore
+          retention-days: 30
